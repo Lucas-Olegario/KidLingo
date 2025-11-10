@@ -2,7 +2,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // 1. Gerenciamento de Pontuação no Cabeçalho
 
-    // Inicializa ou carrega a pontuação (Será sobrescrito pelo valor do banco se a tela de Perfil ou Painel carregar)
+    // Inicializa ou carrega a pontuação
     let points = localStorage.getItem('kidlingoPoints');
     if (!points) {
         points = 0; 
@@ -88,7 +88,6 @@ document.addEventListener('DOMContentLoaded', () => {
 
         async function loadLessonsAndRenderInitial() {
             try {
-                // Rota original para buscar o conteúdo das lições
                 const response = await fetch(`http://localhost:3000/licoes/${selectedLanguage}`);
                 allLessons = await response.json();
                 
@@ -324,7 +323,116 @@ document.addEventListener('DOMContentLoaded', () => {
         loadLessonsAndRenderInitial();
     }
     
-    // 5. Inicialização do Timer Global e Lógica de Sincronização
+    // 5. Funcionalidade Global de Tempo de Estudo e Gamificação
+
+    let allAchievements = [];
+    let timerInterval = null;
+    let secondsStudied = parseInt(sessionStorage.getItem('kidlingoSessionTime')) || 0; 
+    
+    // Sincroniza o tempo de estudo, a pontuação e as lições completas com o backend
+    async function syncProgressWithServer(totalLessonsCompleted) {
+        const currentPoints = parseInt(localStorage.getItem('kidlingoPoints')) || 0;
+        
+        try {
+             // 1. Puxa os dados atuais do servidor
+             const response = await fetch('http://localhost:3000/progresso/simulado');
+             const data = await response.json();
+             
+             if(data && data.tempo_total_seg !== undefined) {
+                 // Adiciona o tempo da sessão ao tempo total do servidor
+                 const newTotalTime = data.tempo_total_seg + secondsStudied;
+                 
+                 // 2. Envia a atualização do tempo, dos pontos e do total de lições
+                 const syncResponse = await fetch('http://localhost:3000/progresso/tempo', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ 
+                        tempo_total_seg: newTotalTime,
+                        pontos_total: currentPoints,
+                        licoes_completadas: totalLessonsCompleted
+                    })
+                });
+
+                if (syncResponse.ok) {
+                    secondsStudied = 0; 
+                    sessionStorage.setItem('kidlingoSessionTime', 0);
+                    
+                    // 3. Após sincronizar, checa se alguma conquista foi desbloqueada
+                    const updatedProgress = await fetch('http://localhost:3000/progresso/simulado').then(r => r.json());
+                    await checkAndUnlockAchievements(updatedProgress);
+                }
+             }
+        } catch (error) {
+            console.error("Erro ao sincronizar progresso:", error);
+        }
+    }
+
+    async function checkAndUnlockAchievements(progressData) {
+        // Carrega as conquistas se ainda não foram carregadas
+        if (allAchievements.length === 0) {
+             const achievementsResponse = await fetch('http://localhost:3000/conquistas');
+             allAchievements = await achievementsResponse.json();
+        }
+
+        let unlockedAchievements = JSON.parse(progressData.conquistas_desbloqueadas || '{}');
+        let totalUnlocks = 0;
+        let mustSync = false;
+
+        for (const achievement of allAchievements) {
+            const achievementId = achievement.id.toString();
+            
+            if (unlockedAchievements[achievementId]) {
+                 totalUnlocks++;
+                 continue;
+            }
+            
+            let isUnlocked = false;
+            
+            // Lógica de checagem com os dados dinâmicos do progresso
+            switch (achievement.tipo) {
+                case 'pontos':
+                    isUnlocked = progressData.pontos_total >= achievement.requisito;
+                    break;
+                case 'licoes':
+                    isUnlocked = progressData.licoes_completadas >= achievement.requisito;
+                    break;
+                case 'tempo':
+                    isUnlocked = progressData.tempo_total_seg >= achievement.requisito;
+                    break;
+            }
+
+            if (isUnlocked) {
+                unlockedAchievements[achievementId] = true;
+                totalUnlocks++;
+                mustSync = true;
+                alert(`🏅 Conquista Desbloqueada: ${achievement.nome}!`);
+            }
+        }
+        
+        if (mustSync) {
+            await fetch('http://localhost:3000/progresso/conquista', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ conquistas_desbloqueadas: unlockedAchievements })
+            });
+        }
+        
+        return totalUnlocks;
+    }
+
+    function startTimer() {
+        if (timerInterval) return;
+        timerInterval = setInterval(() => {
+            secondsStudied++;
+            
+            if (secondsStudied % 10 === 0) {
+                const allCompletedLessons = ['Inglês', 'Espanhol', 'Francês'].reduce((sum, lang) => {
+                     return sum + (parseInt(localStorage.getItem(`kidlingoIndex_${lang}`)) || 0);
+                }, 0);
+                syncProgressWithServer(allCompletedLessons);
+            }
+        }, 1000);
+    }
     
     if (document.getElementById("lessons-screen") || document.getElementById("painel-screen") || document.getElementById('select-language-screen')) {
         startTimer();
@@ -338,9 +446,15 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 
 
-// 6. Funcionalidade do Painel de Acompanhamento (painel-acompanhamento.html)
+// 6. Funcionalidade do Painel de Acompanhamento 
 
     if (document.getElementById("painel-screen")) {
+
+        function formatTime(totalSeconds) {
+            const hours = Math.floor(totalSeconds / 3600);
+            const minutes = Math.floor((totalSeconds % 3600) / 60);
+            return `${hours}h ${String(minutes).padStart(2, '0')}min`;
+        }
 
         async function loadAndDisplayPanelData() {
             
@@ -359,15 +473,48 @@ document.addEventListener('DOMContentLoaded', () => {
             totalTimeValue.textContent = formatTime(progressData.tempo_total_seg || 0);
             achievementsValue.textContent = totalUnlocked;
 
-            // 3. Progresso por Idioma (CHAMADA DA FUNÇÃO REUTILIZÁVEL)
-            loadLanguageProgress('language-progress-grid');
+            // 3. Progresso por Idioma (Usa dados dinâmicos do servidor para o TOTAL)
+            const languageProgressGrid = document.getElementById('language-progress-grid');
+            languageProgressGrid.innerHTML = '';
+            
+            const languages = ['Inglês', 'Espanhol', 'Francês']; 
+
+            for (const lang of languages) {
+                
+                const totalResponse = await fetch(`http://localhost:3000/licoes/total/${lang}`);
+                const totalData = await totalResponse.json();
+                const totalLessons = totalData.total || 0;
+
+                const completedLessons = parseInt(localStorage.getItem(`kidlingoIndex_${lang}`)) || 0; 
+
+                let percentage = 0;
+                if (totalLessons > 0) {
+                    percentage = Math.floor((completedLessons / totalLessons) * 100);
+                }
+                
+                const progressCard = document.createElement('div');
+                progressCard.classList.add('stat-card', 'language-progress-card');
+                
+                progressCard.innerHTML = `
+                    <h4>Progresso em ${lang}</h4>
+                    <div class="value">${percentage}%</div>
+                    <div class="progress-bar-container">
+                        <div class="progress-bar" style="width: ${percentage}%;"></div>
+                    </div>
+                    <p style="font-size: 0.8rem; margin-top: 5px; color: var(--cor-texto-cinza);">
+                        ${completedLessons} de ${totalLessons} lições
+                    </p>
+                `;
+
+                languageProgressGrid.appendChild(progressCard);
+            }
         }
         
         loadAndDisplayPanelData();
     }
+});
 
-
-// 7. Funcionalidade do Perfil (perfil.html)
+// 7. Funcionalidade do Perfil 
 
     if (document.getElementById("profile-screen")) {
 
@@ -442,197 +589,48 @@ document.addEventListener('DOMContentLoaded', () => {
                      achievementsDisplay.innerHTML = `<p style="text-align: center; color: var(--cor-texto-cinza);">Nenhuma conquista desbloqueada ainda. Continue aprendendo para ganhar a primeira!</p>`;
                 }
             }
-        }
-        
-        // Carrega os dados do Perfil (Pontos, Conquistas)
-        loadAndDisplayProfileData();
-        
-        // NOVO: Adiciona a chamada para o progresso dos idiomas na tela de perfil
-        // Assumindo que você adicionou o ID 'profile-language-progress-grid' no perfil.html
-        loadLanguageProgress('profile-language-progress-grid');
-    }
-});
-
-// Função auxiliar para buscar o total de lições por idioma
-async function fetchTotalLessons(language) {
-    try {
-        // Nota: A rota no seu código original do Painel era 'licoes/total/:lang', mas no Quiz era 'licoes/:lang'.
-        // Mantenho a rota mais específica 'licoes/total/:lang' para este cálculo.
-        const response = await fetch(`http://localhost:3000/licoes/total/${language}`);
-        if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
-        const data = await response.json();
-        // A resposta esperada do server.js (como visto na sua lógica original) é { total: X }
-        return { total: data.total || 0 }; 
-    } catch (error) {
-        console.error(`Erro ao buscar total de lições para ${language}:`, error);
-        return { total: 0 };
-    }
-}
-
-// Função reutilizável para carregar e exibir o progresso dos idiomas em qualquer grid
-async function loadLanguageProgress(containerId) {
-    const progressGrid = document.getElementById(containerId);
-    if (!progressGrid) return; 
-
-    // Limpa o conteúdo inicial
-    progressGrid.innerHTML = ''; 
-
-    const languages = ['Inglês', 'Espanhol', 'Francês'];
-
-    for (const lang of languages) {
-        // Busca o total de lições no servidor
-        const totalData = await fetchTotalLessons(lang);
-        const totalLessons = totalData.total || 0;
-
-        // Recupera o progresso de lições completadas do localStorage
-        const completedLessons = parseInt(localStorage.getItem(`kidlingoIndex_${lang}`)) || 0; 
-
-        let percentage = 0;
-        if (totalLessons > 0) {
-            percentage = Math.floor((completedLessons / totalLessons) * 100);
-        }
-        
-        const progressCard = document.createElement('div');
-        progressCard.classList.add('stat-card', 'language-progress-card');
-        
-        // Define a cor da barra (baseado na sua lógica existente)
-        const barColor = lang === 'Inglês' ? '#a256f6' : lang === 'Espanhol' ? '#17a2b8' : '#ffc107';
-
-        progressCard.innerHTML = `
-            <h4>Progresso em ${lang}</h4>
-            <div class="value">${percentage}%</div>
-            <div class="progress-bar-container">
-                <div class="progress-bar" style="width: ${percentage}%; background-color: ${barColor};"></div>
-            </div>
-            <p style="font-size: 0.8rem; margin-top: 5px; color: var(--cor-texto-cinza);">
-                ${completedLessons} de ${totalLessons} lições
-            </p>
-        `;
-
-        progressGrid.appendChild(progressCard);
-    }
-    
-    // Se não houver progresso exibido, mostra uma mensagem (opcional)
-    if (progressGrid.children.length === 0) {
-        progressGrid.innerHTML = `<p style="font-size: 0.9rem; color: var(--cor-texto-cinza); width: 100%; text-align: center;">Nenhuma lição encontrada para exibir. Verifique o servidor.</p>`;
-    }
-}
 
 
-// FUNÇÕES DE TEMPO E GAMIFICAÇÃO 
+            // 5. Exibe Resumo de Lições (Mantendo a lógica de localStorage e lições totais)
+            const lessonSummaryGrid = document.getElementById('lesson-summary-grid');
+            lessonSummaryGrid.innerHTML = '';
+            
+            const languages = ['Inglês', 'Espanhol', 'Francês']; 
 
-let allAchievements = [];
-let timerInterval = null;
-let secondsStudied = parseInt(sessionStorage.getItem('kidlingoSessionTime')) || 0; 
-
-// Sincroniza o tempo de estudo, a pontuação e as lições completas com o backend
-async function syncProgressWithServer(totalLessonsCompleted) {
-    const currentPoints = parseInt(localStorage.getItem('kidlingoPoints')) || 0;
-    
-    try {
-         // 1. Puxa os dados atuais do servidor
-         const response = await fetch('http://localhost:3000/progresso/simulado');
-         const data = await response.json();
-         
-         if(data && data.tempo_total_seg !== undefined) {
-             // Adiciona o tempo da sessão ao tempo total do servidor
-             const newTotalTime = data.tempo_total_seg + secondsStudied;
-             
-             // 2. Envia a atualização do tempo, dos pontos e do total de lições
-             const syncResponse = await fetch('http://localhost:3000/progresso/tempo', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ 
-                    tempo_total_seg: newTotalTime,
-                    pontos_total: currentPoints,
-                    licoes_completadas: totalLessonsCompleted
-                })
-            });
-
-            if (syncResponse.ok) {
-                secondsStudied = 0; 
-                sessionStorage.setItem('kidlingoSessionTime', 0);
+            for (const lang of languages) {
                 
-                // 3. Após sincronizar, checa se alguma conquista foi desbloqueada
-                const updatedProgress = await fetch('http://localhost:3000/progresso/simulado').then(r => r.json());
-                await checkAndUnlockAchievements(updatedProgress);
+                const totalResponse = await fetch(`http://localhost:3000/licoes/total/${lang}`);
+                const totalData = await totalResponse.json();
+                const totalLessons = totalData.total || 0;
+
+                // Usa o índice salvo localmente para o progresso do usuário
+                const completedLessons = parseInt(localStorage.getItem(`kidlingoIndex_${lang}`)) || 0; 
+
+                let percentage = 0;
+                if (totalLessons > 0) {
+                    percentage = Math.floor((completedLessons / totalLessons) * 100);
+                }
+                
+                const progressCard = document.createElement('div');
+                progressCard.classList.add('stat-card', 'language-progress-card');
+                
+                // Escolhe a cor da barra de progresso 
+                const barColor = lang === 'Inglês' ? '#a256f6' : lang === 'Espanhol' ? '#17a2b8' : '#ffc107';
+
+                progressCard.innerHTML = `
+                    <h4>Progresso em ${lang}</h4>
+                    <div class="value">${percentage}%</div>
+                    <div class="progress-bar-container">
+                        <div class="progress-bar" style="width: ${percentage}%; background-color: ${barColor};"></div>
+                    </div>
+                    <p style="font-size: 0.8rem; margin-top: 5px; color: var(--cor-texto-cinza);">
+                        ${completedLessons} de ${totalLessons} lições
+                    </p>
+                `;
+
+                lessonSummaryGrid.appendChild(progressCard);
             }
-         }
-    } catch (error) {
-        console.error("Erro ao sincronizar progresso:", error);
-    }
-}
-
-async function checkAndUnlockAchievements(progressData) {
-    // Carrega as conquistas se ainda não foram carregadas
-    if (allAchievements.length === 0) {
-         const achievementsResponse = await fetch('http://localhost:3000/conquistas');
-         allAchievements = await achievementsResponse.json();
-    }
-
-    let unlockedAchievements = JSON.parse(progressData.conquistas_desbloqueadas || '{}');
-    let totalUnlocks = 0;
-    let mustSync = false;
-
-    for (const achievement of allAchievements) {
-        const achievementId = achievement.id.toString();
-        
-        if (unlockedAchievements[achievementId]) {
-             totalUnlocks++;
-             continue;
         }
         
-        let isUnlocked = false;
-        
-        // Lógica de checagem com os dados dinâmicos do progresso
-        switch (achievement.tipo) {
-            case 'pontos':
-                isUnlocked = progressData.pontos_total >= achievement.requisito;
-                break;
-            case 'licoes':
-                isUnlocked = progressData.licoes_completadas >= achievement.requisito;
-                break;
-            case 'tempo':
-                isUnlocked = progressData.tempo_total_seg >= achievement.requisito;
-                break;
-        }
-
-        if (isUnlocked) {
-            unlockedAchievements[achievementId] = true;
-            totalUnlocks++;
-            mustSync = true;
-            alert(`🏅 Conquista Desbloqueada: ${achievement.nome}!`);
-        }
+        loadAndDisplayProfileData();
     }
-    
-    if (mustSync) {
-        await fetch('http://localhost:3000/progresso/conquista', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ conquistas_desbloqueadas: unlockedAchievements })
-        });
-    }
-    
-    return totalUnlocks;
-}
-
-function startTimer() {
-    if (timerInterval) return;
-    timerInterval = setInterval(() => {
-        secondsStudied++;
-        
-        if (secondsStudied % 10 === 0) {
-            const allCompletedLessons = ['Inglês', 'Espanhol', 'Francês'].reduce((sum, lang) => {
-                 return sum + (parseInt(localStorage.getItem(`kidlingoIndex_${lang}`)) || 0);
-            }, 0);
-            sessionStorage.setItem('kidlingoSessionTime', secondsStudied);
-            syncProgressWithServer(allCompletedLessons);
-        }
-    }, 1000);
-}
-
-function formatTime(totalSeconds) {
-    const hours = Math.floor(totalSeconds / 3600);
-    const minutes = Math.floor((totalSeconds % 3600) / 60);
-    return `${hours}h ${String(minutes).padStart(2, '0')}min`;
-}
